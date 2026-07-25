@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration — auto-review every pull request.
+# Docs: https://docs.coderabbit.ai/guides/configure-coderabbit
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill                 # assertive | chill — lower the noise for a small repo
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true                # review all PRs automatically
+    drafts: false                # skip draft PRs until marked ready
+    base_branches:
+      - master
+  path_filters:
+    - "!dist/**"                 # generated build output
+    - "!**/*.min.js"
+  tools:
+    github-checks:
+      enabled: true
+
+chat:
+  auto_reply: true
