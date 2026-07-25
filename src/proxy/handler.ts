@@ -9,10 +9,10 @@ import {
   DEFAULT_PRICING,
   computeRouteCost,
 } from '../models.js';
-import { executeRoute } from '../route.js';
-import { normalizeParamsForTier } from '../params.js';
+import { executeRoute, startRouteStream, type MessageStream } from '../route.js';
 import { term } from './term.js';
 import { appendEvent } from './history.js';
+import { buildRouteEvent, errorRouteEvent, type RouteEvent } from './route-event.js';
 import type { ClassifyInput, ClassifyResult, ModelPricing, RoutingTuning, Tier } from '../types.js';
 
 export type Provider = 'anthropic' | 'bedrock' | 'vertex';
@@ -46,34 +46,6 @@ export interface HandlerConfig {
    * is an explicit setting and never read from the environment.
    */
   upstream?: string;
-}
-
-export interface RouteEvent {
-  timestamp: string;
-  tier: Tier | 'passthrough';
-  model: string;
-  costCents: number;
-  savedCents: number;
-  confidence: number;
-  classifier: string;
-  retried: boolean;
-  retryReason: string | null;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-  /**
-   * Set to false when `costCents`/`savedCents` are placeholder zeros because the
-   * model has no known price. Absent means priced — history.jsonl lines written
-   * before this field existed must keep counting as measured.
-   */
-  priced?: boolean;
-  /**
-   * Set when the request failed mid-flight (stream died after headers were
-   * sent). `foldOutcome` counts such events only toward `RouteTotals.errors` —
-   * their zeros are placeholders, not measurements.
-   */
-  error?: string;
 }
 
 export const MAX_HISTORY = 1000;
@@ -344,8 +316,10 @@ export async function handleMessages(
       ? { tier: pinTier, score: 0, method: 'pinned', ms: 0, confidence: 1, reason: 'session:coordinator-pinned' }
       : await classify(client, buildClassifyInput(body), config);
 
+  // The tier's model is resolved inside the routing kernel, which is also where
+  // an unknown tier is caught — resolving it here too gave the non-streaming
+  // path a `model` argument it never read.
   const tier = classifyResult.tier;
-  const model = config.models[tier];
 
   // Remove 'model' and 'stream' from body, we control them
   const { model: _m, stream: _s, ...apiParams } = body;
@@ -356,10 +330,10 @@ export async function handleMessages(
   const anthropicBeta = c.req.header('anthropic-beta');
 
   if (isStreaming) {
-    return handleStreaming(c, client, apiParams, tier, model, classifyResult, config, anthropicBeta);
+    return handleStreaming(c, client, apiParams, tier, classifyResult, config, anthropicBeta);
   }
 
-  return handleNonStreaming(c, client, apiParams, tier, model, classifyResult, config, anthropicBeta);
+  return handleNonStreaming(c, client, apiParams, tier, classifyResult, config, anthropicBeta);
 }
 
 /** SDK request options that relay the client's anthropic-beta header, if any. */
@@ -372,7 +346,6 @@ async function handleNonStreaming(
   client: Anthropic,
   apiParams: Record<string, unknown>,
   tier: Tier,
-  model: string,
   classifyResult: ClassifyResult,
   config: HandlerConfig,
   anthropicBeta?: string,
@@ -387,32 +360,23 @@ async function handleNonStreaming(
       requestOptions: reqOpts,
     });
 
-    const { costCents: roundedCost, savedCents, cacheReadTokens, cacheCreationTokens, inputTokens, outputTokens, priced } =
-      computeCosts(result.model, result.response.usage, config);
+    const cost = computeCosts(result.model, result.response.usage, config);
 
     if (config.verbose) {
-      log(result.tier, result.model, classifyResult, roundedCost, savedCents, config.defaultModel, result.retried, result.retryReason, priced);
+      log(result.tier, result.model, classifyResult, cost.costCents, cost.savedCents, config.defaultModel, result.retried, result.retryReason, cost.priced);
     }
 
-    recordEvent({
-      timestamp: new Date().toISOString(),
+    recordEvent(buildRouteEvent({
       tier: result.tier,
       model: result.model,
-      costCents: roundedCost,
-      savedCents,
-      confidence: classifyResult.confidence,
-      classifier: classifyResult.method,
+      cost,
+      classifyResult,
       retried: result.retried,
       retryReason: result.retryReason,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheCreationTokens,
-      ...(priced ? {} : { priced: false as const }),
-    }, config);
+    }), config);
 
     const headers = new Headers({ 'content-type': 'application/json' });
-    setRouterHeaders(headers, result.tier, result.model, roundedCost, savedCents, classifyResult, result.retried, result.retryReason);
+    setRouterHeaders(headers, result.tier, result.model, cost.costCents, cost.savedCents, classifyResult, result.retried, result.retryReason);
 
     return new Response(JSON.stringify(result.response), { status: 200, headers });
   } catch (err) {
@@ -451,7 +415,6 @@ async function handleStreaming(
   client: Anthropic,
   apiParams: Record<string, unknown>,
   tier: Tier,
-  model: string,
   classifyResult: ClassifyResult,
   config: HandlerConfig,
   anthropicBeta?: string,
@@ -461,14 +424,16 @@ async function handleStreaming(
   // 400 validation) surface on the first iterator pull — awaiting it here,
   // before any headers go out, lets them map to proper HTTP statuses exactly
   // like the non-streaming path instead of a `200 OK` carrying an error frame.
-  let stream: ReturnType<Anthropic['messages']['stream']>;
+  let stream: MessageStream;
+  let model: string;
   let iterator: AsyncIterator<Anthropic.MessageStreamEvent>;
   let first: IteratorResult<Anthropic.MessageStreamEvent>;
   try {
-    stream = client.messages.stream(
-      normalizeParamsForTier({ ...apiParams, model }, tier) as Anthropic.MessageStreamParams,
-      betaRequestOptions(anthropicBeta),
-    );
+    // Same kernel the non-streaming path enters, stopping before the retry loop
+    // — model resolution and parameter normalization were duplicated here.
+    ({ stream, model } = startRouteStream(client, apiParams, tier, config.models, {
+      requestOptions: betaRequestOptions(anthropicBeta),
+    }));
     iterator = stream[Symbol.asyncIterator]();
     first = await iterator.next();
   } catch (err) {
@@ -498,29 +463,13 @@ async function handleStreaming(
         }
 
         const finalMessage = await stream.finalMessage();
-        const { costCents: roundedCost, savedCents, cacheReadTokens, cacheCreationTokens, inputTokens, outputTokens, priced } =
-          computeCosts(model, finalMessage.usage, config);
+        const cost = computeCosts(model, finalMessage.usage, config);
 
         if (config.verbose) {
-          log(tier, model, classifyResult, roundedCost, savedCents, config.defaultModel, false, null, priced);
+          log(tier, model, classifyResult, cost.costCents, cost.savedCents, config.defaultModel, false, null, cost.priced);
         }
 
-        recordEvent({
-          timestamp: new Date().toISOString(),
-          tier,
-          model,
-          costCents: roundedCost,
-          savedCents,
-          confidence: classifyResult.confidence,
-          classifier: classifyResult.method,
-          retried: false,
-          retryReason: null,
-          inputTokens,
-          outputTokens,
-          cacheReadTokens,
-          cacheCreationTokens,
-          ...(priced ? {} : { priced: false as const }),
-        }, config);
+        recordEvent(buildRouteEvent({ tier, model, cost, classifyResult }), config);
 
         controller.close();
       } catch (err) {
@@ -535,20 +484,7 @@ async function handleStreaming(
             `${term.dim('[claude-router]')} ${term.red('stream error')} → ${tier} (${model}): ${String(err)}`,
           );
         }
-        recordEvent({
-          timestamp: new Date().toISOString(),
-          tier,
-          model,
-          costCents: 0,
-          savedCents: 0,
-          confidence: classifyResult.confidence,
-          classifier: classifyResult.method,
-          retried: false,
-          retryReason: null,
-          inputTokens: 0,
-          outputTokens: 0,
-          error: String(err).slice(0, 200),
-        }, config);
+        recordEvent(errorRouteEvent({ tier, model, classifyResult, error: err }), config);
         controller.close();
       }
     },

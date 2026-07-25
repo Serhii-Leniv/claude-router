@@ -1,7 +1,16 @@
 import { emptyTotals, foldOutcome, tierBreakdown } from '../totals.js';
+import { DISPLAY_TIERS, type DisplayTier } from '../models.js';
 import { savedCentsDisplay } from './format.js';
-import type { RouteEvent } from './handler.js';
+import type { RouteEvent } from './route-event.js';
 import type { LifetimeStats } from './history.js';
+
+const TIER_BAR_LABEL: Record<DisplayTier, string> = {
+  haiku: 'Haiku',
+  sonnet: 'Sonnet',
+  opus: 'Opus',
+  fable: 'Fable',
+  passthrough: 'Pass',
+};
 
 function esc(s: string): string {
   return s
@@ -20,13 +29,18 @@ export function renderDashboard(history: RouteEvent[], lifetime?: LifetimeStats)
   const totalSaved = totals.savedCents;
   const retried = totals.retried;
 
-  const tierCounts = tierBreakdown(totals, ['haiku', 'sonnet', 'opus', 'passthrough'] as const);
-
-  const total = tierCounts.haiku + tierCounts.sonnet + tierCounts.opus + tierCounts.passthrough || 1;
-  const haikuPct = ((tierCounts.haiku / total) * 100).toFixed(1);
-  const sonnetPct = ((tierCounts.sonnet / total) * 100).toFixed(1);
-  const opusPct = ((tierCounts.opus / total) * 100).toFixed(1);
-  const passPct = ((tierCounts.passthrough / total) * 100).toFixed(1);
+  // DISPLAY_TIERS, not a hand-written list: the list here used to omit `fable`,
+  // which both hid fable routes from the chart and left them out of its own
+  // percentage denominator, so the bars quietly failed to total 100%.
+  const tierCounts = tierBreakdown(totals, DISPLAY_TIERS);
+  const tierTotal = DISPLAY_TIERS.reduce((n, t) => n + tierCounts[t], 0) || 1;
+  const tierBars = DISPLAY_TIERS.map((t) => ({
+    tier: t,
+    pct: ((tierCounts[t] / tierTotal) * 100).toFixed(1),
+  }))
+    .filter((b) => Number(b.pct) > 0)
+    .map((b) => `<div class="tier-${b.tier}" style="width:${b.pct}%">${TIER_BAR_LABEL[b.tier]} ${b.pct}%</div>`)
+    .join('');
 
   // A card reading "$0.0000 saved" is indistinguishable from a quiet week, so
   // any unpriced call gets called out next to the figures it silently deflates.
@@ -73,6 +87,7 @@ export function renderDashboard(history: RouteEvent[], lifetime?: LifetimeStats)
       --gold: #ffd166;
       --green: #0ecb81;
       --red: #f6465d;
+      --violet: #b47cff;
       --steel: #8b95a7;
       --ink: #ece9e2;
       --ink-dim: #8f8a7e;
@@ -227,6 +242,7 @@ export function renderDashboard(history: RouteEvent[], lifetime?: LifetimeStats)
     .tier-haiku       { background: linear-gradient(180deg, #14e695, #0bb371); color: #01180e; box-shadow: 0 0 16px rgba(14, 203, 129, 0.3); }
     .tier-sonnet      { background: linear-gradient(180deg, #ffa53d, #ef8a0e); color: #1d0e00; box-shadow: 0 0 16px rgba(247, 147, 26, 0.35); }
     .tier-opus        { background: linear-gradient(180deg, #ffdd85, #f5c04e); color: #1e1400; box-shadow: 0 0 16px rgba(255, 209, 102, 0.35); }
+    .tier-fable       { background: linear-gradient(180deg, #c79bff, #9d5ff0); color: #16022e; box-shadow: 0 0 16px rgba(180, 124, 255, 0.35); }
     .tier-passthrough { background: linear-gradient(180deg, #55607a, #414b61); color: #dde3ee; }
 
     .table-shell { padding: 4px; }
@@ -270,6 +286,7 @@ export function renderDashboard(history: RouteEvent[], lifetime?: LifetimeStats)
     .badge-haiku       { background: rgba(14, 203, 129, 0.1);  color: var(--green);  border-color: rgba(14, 203, 129, 0.35); }
     .badge-sonnet      { background: rgba(247, 147, 26, 0.1);  color: var(--orange); border-color: rgba(247, 147, 26, 0.4); }
     .badge-opus        { background: rgba(255, 209, 102, 0.1); color: var(--gold);   border-color: rgba(255, 209, 102, 0.4); }
+    .badge-fable       { background: rgba(180, 124, 255, 0.1); color: var(--violet); border-color: rgba(180, 124, 255, 0.4); }
     .badge-passthrough { background: rgba(139, 149, 167, 0.1); color: var(--steel);  border-color: rgba(139, 149, 167, 0.35); }
     .badge-retry       { background: rgba(246, 70, 93, 0.1);   color: var(--red);    border-color: rgba(246, 70, 93, 0.4); }
     .none { color: var(--ink-dim); }
@@ -354,10 +371,7 @@ export function renderDashboard(history: RouteEvent[], lifetime?: LifetimeStats)
   <div class="section-label">Tier Distribution</div>
   <div class="tier-shell card">
     <div class="tier-bar">
-      ${Number(haikuPct) > 0 ? `<div class="tier-haiku" style="width:${haikuPct}%">Haiku ${haikuPct}%</div>` : ''}
-      ${Number(sonnetPct) > 0 ? `<div class="tier-sonnet" style="width:${sonnetPct}%">Sonnet ${sonnetPct}%</div>` : ''}
-      ${Number(opusPct) > 0 ? `<div class="tier-opus" style="width:${opusPct}%">Opus ${opusPct}%</div>` : ''}
-      ${Number(passPct) > 0 ? `<div class="tier-passthrough" style="width:${passPct}%">Pass ${passPct}%</div>` : ''}
+      ${tierBars}
     </div>
   </div>
 

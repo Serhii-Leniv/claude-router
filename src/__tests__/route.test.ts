@@ -1,7 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import Anthropic from '@anthropic-ai/sdk';
-import { executeRoute } from '../route.js';
+import { executeRoute, startRouteStream } from '../route.js';
 import { DEFAULT_MODELS } from '../models.js';
 import type { Tier } from '../types.js';
 
@@ -129,5 +129,62 @@ describe('executeRoute', () => {
       Anthropic.RateLimitError,
     );
     assert.equal(createFn.mock.calls.length, 1);
+  });
+});
+
+describe('startRouteStream', () => {
+  function streamingClientWith(streamFn: ReturnType<typeof mock.fn>): Anthropic {
+    return { messages: { stream: streamFn } } as unknown as Anthropic;
+  }
+
+  it('resolves the tier to its model and reports what it sent', () => {
+    const streamFn = mock.fn((..._args: unknown[]) => ({ handle: true }));
+    const result = startRouteStream(streamingClientWith(streamFn), PARAMS, 'opus', DEFAULT_MODELS);
+
+    assert.equal(result.tier, 'opus');
+    assert.equal(result.model, DEFAULT_MODELS.opus);
+    assert.equal((result.stream as unknown as { handle: boolean }).handle, true);
+    assert.equal((streamFn.mock.calls[0]!.arguments[0] as { model: string }).model, DEFAULT_MODELS.opus);
+  });
+
+  it('normalizes params for the routed tier', () => {
+    // The whole point of sharing the kernel: streaming used to call
+    // normalizeParamsForTier itself, so the rule could drift per path. Haiku
+    // rejects adaptive thinking, so it must be stripped before the call.
+    const streamFn = mock.fn((..._args: unknown[]) => ({}));
+    startRouteStream(
+      streamingClientWith(streamFn),
+      { ...PARAMS, thinking: { type: 'adaptive' }, temperature: 0.5 },
+      'haiku',
+      DEFAULT_MODELS,
+    );
+
+    const sent = streamFn.mock.calls[0]!.arguments[0] as Record<string, unknown>;
+    assert.ok(!('thinking' in sent), 'haiku has no adaptive thinking support');
+    assert.equal(sent.temperature, 0.5, 'haiku keeps sampling params');
+  });
+
+  it('rejects an unknown tier with a TypeError before opening a stream', () => {
+    const streamFn = mock.fn((..._args: unknown[]) => ({}));
+
+    assert.throws(
+      () => startRouteStream(streamingClientWith(streamFn), PARAMS, 'gpt4' as Tier, DEFAULT_MODELS),
+      (err: unknown) => {
+        assert.ok(err instanceof TypeError);
+        // Same message, same source of truth as executeRoute — `stream()` used
+        // to raise its own, listing tiers from the config keys instead.
+        assert.match((err as Error).message, /Unknown tier "gpt4" — expected one of: haiku, sonnet, opus, fable/);
+        return true;
+      },
+    );
+    assert.equal(streamFn.mock.calls.length, 0);
+  });
+
+  it('forwards request options to the SDK (the anthropic-beta relay)', () => {
+    const streamFn = mock.fn((..._args: unknown[]) => ({}));
+    const requestOptions = { headers: { 'anthropic-beta': 'context-management-2025-06-27' } };
+    startRouteStream(streamingClientWith(streamFn), PARAMS, 'sonnet', DEFAULT_MODELS, { requestOptions });
+
+    assert.deepEqual(streamFn.mock.calls[0]!.arguments[1], requestOptions);
   });
 });

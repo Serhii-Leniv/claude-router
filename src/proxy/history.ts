@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { emptyTotals, foldOutcome, type RouteTotals } from '../totals.js';
-import type { RouteEvent } from './handler.js';
+import type { RouteEvent } from './route-event.js';
 
 /**
  * Persistent route history: one JSON line per event, append-only.

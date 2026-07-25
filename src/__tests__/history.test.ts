@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appendEvent, readLifetimeStats, resetHistoryCache } from '../proxy/history.js';
-import type { RouteEvent } from '../proxy/handler.js';
+import type { RouteEvent } from '../proxy/route-event.js';
 
 function makeEvent(overrides: Partial<RouteEvent> = {}): RouteEvent {
   return {

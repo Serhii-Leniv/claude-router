@@ -1,4 +1,4 @@
-import type { RouteEvent } from './handler.js';
+import type { RouteEvent } from './route-event.js';
 
 /**
  * The `/health` contract, defined once. `server.ts` produces it; `daemon.ts`

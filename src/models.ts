@@ -108,6 +108,20 @@ export const DEFAULT_PRICING: Record<string, ModelPricing> = {
 export const TIER_ORDER: Tier[] = ['haiku', 'sonnet', 'opus', 'fable'];
 
 /**
+ * The fixed label set for a per-tier breakdown: every tier, plus `passthrough`
+ * for requests that bypassed routing. `RouteTotals.tiers` carries only labels
+ * actually seen, so consumers that render a stable set (the dashboard bars,
+ * `claude-router stats`) zero-fill from this via `tierBreakdown`.
+ *
+ * Derived from TIER_ORDER on purpose: both consumers used to spell the list out
+ * by hand and both had gone stale, omitting `fable` — a fable route was folded
+ * into the totals and then rendered nowhere, and it was excluded from the bar
+ * chart's own percentage denominator.
+ */
+export const DISPLAY_TIERS = [...TIER_ORDER, 'passthrough'] as const;
+export type DisplayTier = (typeof DISPLAY_TIERS)[number];
+
+/**
  * Automatic escalation stops here. Fable is 2x opus, and the triggers that would
  * reach it — truncation and refusal — have never fired on real traffic
  * (`research/2026-07-21-detector-measurement.md`: 0 of 35,314 responses). Paying
@@ -277,5 +291,50 @@ export function computeRouteCost(
     inputTokens,
     outputTokens,
     priced: modelPriced && baselinePriced,
+  };
+}
+
+/** The cost and token fields a route outcome record carries, plus the `priced` flag. */
+export interface RouteCostFields {
+  costCents: number;
+  savedCents: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  priced?: false;
+}
+
+/**
+ * Shape a {@link RouteCost} into the fields every route outcome record carries.
+ *
+ * The library's `RouteMeta` and the proxy's `RouteEvent` are different records,
+ * but the step from priced call to recorded figures is the same one — and it
+ * used to be written out longhand at four sites (`index.buildMeta`, plus the
+ * non-streaming, streaming-success and streaming-error paths in the proxy
+ * handler), which is how `priced` and the cache-token fields drifted between
+ * them. One place to change means one place to get it wrong.
+ *
+ * `priced` is emitted **only when false**: absent means priced, so history lines
+ * written before the flag existed keep counting as measured.
+ */
+export function costFields(cost: RouteCost): RouteCostFields {
+  const {
+    costCents,
+    savedCents,
+    cacheReadTokens,
+    cacheCreationTokens,
+    inputTokens,
+    outputTokens,
+    priced,
+  } = cost;
+  return {
+    costCents,
+    savedCents,
+    cacheReadTokens,
+    cacheCreationTokens,
+    inputTokens,
+    outputTokens,
+    ...(priced ? {} : { priced: false as const }),
   };
 }

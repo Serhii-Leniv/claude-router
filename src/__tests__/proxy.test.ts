@@ -4,7 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { createProxyApp } from '../proxy/server.js';
 import { routeHistory, boundHistory, MAX_HISTORY, getAnthropicClient, clearClientCache } from '../proxy/handler.js';
 import { renderDashboard } from '../proxy/dashboard.js';
-import type { RouteEvent } from '../proxy/handler.js';
+import type { RouteEvent } from '../proxy/route-event.js';
 
 import { DEFAULT_MODELS } from '../models.js';
 
@@ -198,6 +198,32 @@ describe('renderDashboard', () => {
     assert.ok(html.includes('Lifetime Saved'));
     assert.ok(html.includes('$47.00'));
     assert.ok(html.includes('42'));
+  });
+
+  it('shows fable in the tier bar and its own percentage denominator', () => {
+    // Regression: the tier label set was written out by hand here and in
+    // `stats`, and both had gone stale. A fable route folded into the totals and
+    // then appeared nowhere — and because it was missing from the denominator
+    // too, the remaining bars added up to more than 100%.
+    const events: RouteEvent[] = (['fable', 'sonnet'] as const).map((tier, i) => ({
+      timestamp: `2026-05-01T12:0${i}:00.000Z`,
+      tier,
+      model: `claude-${tier}-5`,
+      costCents: 1,
+      savedCents: 0,
+      confidence: 0.9,
+      classifier: 'heuristic',
+      retried: false,
+      retryReason: null,
+      inputTokens: 10,
+      outputTokens: 10,
+    }));
+
+    const html = renderDashboard(events);
+    assert.ok(html.includes('tier-fable'), 'fable gets a bar');
+    assert.ok(html.includes('Fable 50.0%'), 'fable is half of two requests');
+    assert.ok(html.includes('Sonnet 50.0%'), 'and sonnet is the other half');
+    assert.ok(html.includes('badge-fable'), 'fable rows get a styled badge');
   });
 
   it('renders with data', () => {

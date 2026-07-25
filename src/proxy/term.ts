@@ -34,6 +34,8 @@ export interface Term {
   fail: () => string;
   warn: () => string;
   /** Red message to stderr */
+  /** The text `errorLine` prints, as a value — for callers that return output. */
+  errorText: (msg: string) => string;
   errorLine: (msg: string) => void;
   /** Box with width computed from visible (ANSI-stripped) content */
   box: (title: string, rows: Array<[string, string]>) => string;
@@ -93,6 +95,7 @@ export function createTerm(opts?: { forceColor?: boolean }): Term {
     ok: () => green('✓'),
     fail: () => red('✗'),
     warn: () => yellow('!'),
+    errorText: (msg: string) => red(`✗ ${msg}`),
     errorLine: (msg: string) => console.error(red(`✗ ${msg}`)),
     box,
     enabled,

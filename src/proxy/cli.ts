@@ -5,10 +5,23 @@ import type { Hono } from 'hono';
 import fs from 'node:fs';
 import { createProxyApp } from './server.js';
 import { createProviderClient, DEFAULT_UPSTREAM, type Provider } from './handler.js';
-import { DEFAULT_MODELS, BEDROCK_MODELS, VERTEX_MODELS } from '../models.js';
+import { DEFAULT_MODELS, BEDROCK_MODELS, VERTEX_MODELS, DISPLAY_TIERS } from '../models.js';
 import type { Tier } from '../types.js';
 import { term } from './term.js';
 import { formatSavedCents } from './format.js';
+import {
+  err,
+  failLine,
+  failed,
+  ok,
+  out,
+  raw,
+  renderResult,
+  warnLine,
+  type CommandResult,
+  type OutputLine,
+} from './command.js';
+import { failureCount, formatDiagnostics, runDiagnostics, type DoctorProbes } from './doctor.js';
 import {
   CliUsageError,
   applyRegionEnv,
@@ -19,7 +32,7 @@ import {
   routerPaths,
   serveArgsFrom,
   suggestCommand,
-  type FileConfig,
+  type RouterPaths,
   type ServeOptions,
 } from './cli-config.js';
 import {
@@ -54,16 +67,21 @@ const COMMANDS = [
   'install', 'uninstall', 'init', 'doctor', 'help',
 ];
 
-const paths = routerPaths();
-
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function loadConfigWarned(): FileConfig {
+/**
+ * Parse the serve options, carrying any config-file complaint back as a line
+ * rather than printing it. Every command starts its output with these.
+ */
+function resolveOptions(
+  args: string[],
+  paths: RouterPaths,
+): { options: ServeOptions; warnings: OutputLine[] } {
   const { config, error } = loadFileConfig(paths.configFile);
-  if (error) {
-    console.error(term.warn() + ` Ignoring invalid config at ${paths.configFile}: ${error}`);
-  }
-  return config;
+  const warnings = error
+    ? [warnLine(`Ignoring invalid config at ${paths.configFile}: ${error}`)]
+    : [];
+  return { options: parseServeArgs(args, config), warnings };
 }
 
 /** Split command-specific boolean flags out of an arg list before serve parsing. */
@@ -79,9 +97,9 @@ function extractFlags(args: string[], flags: string[]): { rest: string[]; found:
   return { rest, found };
 }
 
-function printStep(result: StepResult): void {
+function stepLine(result: StepResult): OutputLine {
   const glyph = result.ok ? term.ok() : result.skipped ? term.warn() : term.fail();
-  console.log(`  ${glyph} ${result.detail}`);
+  return out(`  ${glyph} ${result.detail}`);
 }
 
 function modelsForProvider(provider: Provider): Record<Tier, string> {
@@ -90,72 +108,50 @@ function modelsForProvider(provider: Provider): Record<Tier, string> {
   return DEFAULT_MODELS;
 }
 
-function resolveOptions(args: string[]): ServeOptions {
-  return parseServeArgs(args, loadConfigWarned());
-}
-
 // ── start ──────────────────────────────────────────────────────────────────
 
-async function cmdStart(args: string[]): Promise<void> {
-  const { rest, found } = extractFlags(args, ['--daemon', '-d']);
-  const options = resolveOptions(rest);
+/** True when the bind address reaches beyond this machine. */
+export function isNetworkExposed(host: string): boolean {
+  return host !== '127.0.0.1' && host !== 'localhost';
+}
 
-  if (found.size > 0) {
-    const result = await startDaemon(serveArgsFrom(options), options.port, paths);
-    if (result.ok) {
-      console.log(`${term.ok()} ${result.detail}`);
-      console.log(term.dim(`  logs: claude-router logs   stop: claude-router stop`));
-    } else {
-      term.errorLine(result.detail);
-      process.exit(1);
-    }
-    return;
+/**
+ * The startup banner, plus the network-exposure warning that must precede it.
+ *
+ * Pure so both are testable: the warning is a security notice with two distinct
+ * texts (an unauthenticated relay to Anthropic vs. exposed cloud credentials),
+ * and the "Upstream" row is deliberately unconditional when redirected —
+ * silently sending traffic somewhere other than Anthropic is the worst failure
+ * this tool can hide.
+ */
+export function startBanner(
+  options: ServeOptions,
+  models: Record<Tier, string>,
+  configLoaded: boolean,
+  paths: RouterPaths,
+): OutputLine[] {
+  const lines: OutputLine[] = [];
+  const exposed = isNetworkExposed(options.host);
+
+  if (exposed) {
+    // Every provider is dangerous on a network bind: bedrock/vertex spend the
+    // operator's cloud credentials, and anthropic is an unauthenticated open
+    // relay to api.anthropic.com for anyone who supplies a key.
+    lines.push(
+      err(
+        term.warn() +
+          (options.provider === 'anthropic'
+            ? ` Binding to ${options.host} makes this proxy an open, unauthenticated relay to the Anthropic API for anyone on the network.`
+            : ` Binding to ${options.host} with the ${options.provider} provider exposes YOUR cloud credentials to the network — incoming requests are not authenticated.`),
+      ),
+    );
   }
-
-  applyRegionEnv(options);
-  const models = { ...modelsForProvider(options.provider), ...(options.tiers ?? {}) };
-
-  let providerClient;
-  try {
-    providerClient = await createProviderClient(options.provider);
-  } catch (err) {
-    term.errorLine(`Provider init failed: ${String(err)}`);
-    process.exit(1);
-  }
-
-  const app = createProxyApp({
-    classifier: options.classifier,
-    defaultModel: models.sonnet,
-    verbose: options.verbose,
-    provider: options.provider,
-    models,
-    forceRoute: options.forceRoute,
-    sessionModel: options.sessionModel ? (options.sessionModel as Tier) : undefined,
-    pricing: options.pricing,
-    routing: options.routing,
-    historyFile: paths.historyFile,
-    upstream: options.upstream,
-  }, providerClient);
 
   const regionDisplay = options.region ||
     (options.provider === 'bedrock' ? process.env['AWS_REGION'] ?? 'us-east-1' :
      options.provider === 'vertex' ? process.env['ANTHROPIC_VERTEX_REGION'] ?? 'us-east5' : '');
 
-  const exposed = options.host !== '127.0.0.1' && options.host !== 'localhost';
-  if (exposed) {
-    // Every provider is dangerous on a network bind: bedrock/vertex spend the
-    // operator's cloud credentials, and anthropic is an unauthenticated open
-    // relay to api.anthropic.com for anyone who supplies a key.
-    console.error(
-      term.warn() +
-        (options.provider === 'anthropic'
-          ? ` Binding to ${options.host} makes this proxy an open, unauthenticated relay to the Anthropic API for anyone on the network.`
-          : ` Binding to ${options.host} with the ${options.provider} provider exposes YOUR cloud credentials to the network — incoming requests are not authenticated.`),
-    );
-  }
-
   const displayHost = exposed ? options.host : 'localhost';
-  const { loaded } = loadFileConfig(paths.configFile);
   const rows: Array<[string, string]> = [
     ['URL', term.accent(`http://${displayHost}:${options.port}`)],
     ['Dashboard', `http://${displayHost}:${options.port}/dashboard`],
@@ -182,12 +178,56 @@ async function cmdStart(args: string[]): Promise<void> {
   }
   if (exposed) rows.push(['Bind', `${options.host} ${term.yellow('(network-exposed)')}`]);
   if (regionDisplay) rows.push(['Region', regionDisplay]);
-  if (loaded) rows.push(['Config', paths.configFile]);
+  if (configLoaded) rows.push(['Config', paths.configFile]);
 
-  console.log('\n' + term.box(`claude-router ${term.dim('v' + getVersion())}`, rows) + '\n');
+  lines.push(out('\n' + term.box(`claude-router ${term.dim('v' + getVersion())}`, rows) + '\n'));
+  return lines;
+}
 
-  process.on('unhandledRejection', (err) => {
-    term.errorLine(`Fatal error: ${String(err)}`);
+async function cmdStart(args: string[], paths: RouterPaths): Promise<CommandResult> {
+  const { rest, found } = extractFlags(args, ['--daemon', '-d']);
+  const { options, warnings } = resolveOptions(rest, paths);
+
+  if (found.size > 0) {
+    const result = await startDaemon(serveArgsFrom(options), options.port, paths);
+    if (!result.ok) return failed([...warnings, failLine(result.detail)]);
+    return ok([
+      ...warnings,
+      out(`${term.ok()} ${result.detail}`),
+      out(term.dim(`  logs: claude-router logs   stop: claude-router stop`)),
+    ]);
+  }
+
+  applyRegionEnv(options);
+  const models = { ...modelsForProvider(options.provider), ...(options.tiers ?? {}) };
+
+  let providerClient;
+  try {
+    providerClient = await createProviderClient(options.provider);
+  } catch (e) {
+    return failed([...warnings, failLine(`Provider init failed: ${String(e)}`)]);
+  }
+
+  const app = createProxyApp({
+    classifier: options.classifier,
+    defaultModel: models.sonnet,
+    verbose: options.verbose,
+    provider: options.provider,
+    models,
+    forceRoute: options.forceRoute,
+    sessionModel: options.sessionModel ? (options.sessionModel as Tier) : undefined,
+    pricing: options.pricing,
+    routing: options.routing,
+    historyFile: paths.historyFile,
+    upstream: options.upstream,
+  }, providerClient);
+
+  const { loaded } = loadFileConfig(paths.configFile);
+
+  // Process-global handlers stay here rather than in `startServer`: they outlive
+  // any one bind, and a test that imports `startServer` must not inherit them.
+  process.on('unhandledRejection', (e) => {
+    term.errorLine(`Fatal error: ${String(e)}`);
     if (options.provider === 'vertex') {
       console.error('\nVertex auth failed. Run: gcloud auth application-default login');
     } else if (options.provider === 'bedrock') {
@@ -209,6 +249,8 @@ async function cmdStart(args: string[]): Promise<void> {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  return ok([...warnings, ...startBanner(options, models, loaded, paths)]);
 }
 
 /**
@@ -227,14 +269,14 @@ export function startServer(
 ): ServerType {
   const server = serve({ fetch: app.fetch, port, hostname });
 
-  server.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE') {
+  server.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EADDRINUSE') {
       term.errorLine(`Port ${port} is already in use — another proxy or app owns it.`);
       console.error(term.dim(`  Check: claude-router status   ·   or pick a port: claude-router start --port <n>`));
-    } else if (err.code === 'EACCES') {
+    } else if (e.code === 'EACCES') {
       term.errorLine(`No permission to bind ${hostname}:${port}.`);
     } else {
-      term.errorLine(`Server error: ${String(err)}`);
+      term.errorLine(`Server error: ${String(e)}`);
     }
     onFatal(1);
   });
@@ -244,44 +286,48 @@ export function startServer(
 
 // ── stop / restart ─────────────────────────────────────────────────────────
 
-async function cmdStop(): Promise<void> {
+async function cmdStop(_args: string[], paths: RouterPaths): Promise<CommandResult> {
   const result = await stopDaemon(paths);
-  if (result.ok) {
-    console.log(`${term.ok()} ${result.detail}`);
-  } else {
-    term.errorLine(result.detail);
-    process.exit(1);
-  }
+  return result.ok
+    ? ok([out(`${term.ok()} ${result.detail}`)])
+    : failed([failLine(result.detail)]);
 }
 
-async function cmdRestart(args: string[]): Promise<void> {
+/**
+ * Which options a restart runs with: the ones just given, else the ones the
+ * previous daemon recorded, else defaults. Pure, because "does a restart carry
+ * `--force-route` over" is the whole point of the command.
+ */
+export function restartArgs(args: string[], previous: string[] | undefined): string[] {
+  return args.length > 0 ? args : previous ?? [];
+}
+
+async function cmdRestart(args: string[], paths: RouterPaths): Promise<CommandResult> {
   const state = readDaemonState(paths);
   const stop = await stopDaemon(paths);
-  if (!stop.ok) {
-    term.errorLine(stop.detail);
-    process.exit(1);
-  }
-  // Reuse the previous daemon's args unless new flags were given
+  if (!stop.ok) return failed([failLine(stop.detail)]);
+
+  const lines: OutputLine[] = [];
   if (args.length === 0 && !state) {
-    console.error(
-      term.warn() +
-        ' No previous daemon state found — restarting with defaults. Any flags the old daemon ran with (e.g. --force-route, --provider) are not carried over; pass them again if needed.',
+    lines.push(
+      warnLine(
+        'No previous daemon state found — restarting with defaults. Any flags the old daemon ran with (e.g. --force-route, --provider) are not carried over; pass them again if needed.',
+      ),
     );
   }
-  const options = resolveOptions(args.length > 0 ? args : state?.args ?? []);
+
+  const { options, warnings } = resolveOptions(restartArgs(args, state?.args), paths);
+  lines.push(...warnings);
+
   const result = await startDaemon(serveArgsFrom(options), options.port, paths);
-  if (result.ok) {
-    console.log(`${term.ok()} ${result.detail}`);
-  } else {
-    term.errorLine(result.detail);
-    process.exit(1);
-  }
+  if (!result.ok) return failed([...lines, failLine(result.detail)]);
+  return ok([...lines, out(`${term.ok()} ${result.detail}`)]);
 }
 
 // ── status ─────────────────────────────────────────────────────────────────
 
-async function cmdStatus(args: string[]): Promise<void> {
-  const options = resolveOptions(args);
+async function cmdStatus(args: string[], paths: RouterPaths): Promise<CommandResult> {
+  const { options, warnings } = resolveOptions(args, paths);
   const state = readDaemonState(paths);
   // A foreground `start --port` writes no daemon.json, so only an explicit
   // --port here can reach it; a background daemon records its port, so prefer
@@ -294,13 +340,15 @@ async function cmdStatus(args: string[]): Promise<void> {
   const health = await checkHealth(check.port);
 
   if (!health) {
-    console.log(`${term.fail()} ${term.bold('stopped')} ${term.dim(`(${stoppedStatusDetail(check)})`)}`);
+    const lines = [
+      ...warnings,
+      out(`${term.fail()} ${term.bold('stopped')} ${term.dim(`(${stoppedStatusDetail(check)})`)}`),
+    ];
     if (state && !isProcessAlive(state.pid)) {
-      console.log(term.dim(`  stale daemon state found (pid ${state.pid} is gone)`));
+      lines.push(out(term.dim(`  stale daemon state found (pid ${state.pid} is gone)`)));
     }
-    console.log(`\nStart it:  ${term.accent('claude-router start -d')}  ${term.dim('(or claude-router install)')}`);
-    process.exitCode = 1;
-    return;
+    lines.push(out(`\nStart it:  ${term.accent('claude-router start -d')}  ${term.dim('(or claude-router install)')}`));
+    return failed(lines);
   }
 
   // Only name a pid when the port that answered is the daemon's own (#52).
@@ -317,26 +365,25 @@ async function cmdStatus(args: string[]): Promise<void> {
     ['Autostart', isAutostartRegistered(paths) ? term.green('registered') : term.dim('not registered')],
     ['Env var', isEnvVarSet(check.port) ? term.green('set') : term.dim('not set')],
   ];
-  console.log('\n' + term.box('claude-router status', rows) + '\n');
+  return ok([...warnings, out('\n' + term.box('claude-router status', rows) + '\n')]);
 }
 
 // ── stats ──────────────────────────────────────────────────────────────────
 
-function cmdStats(args: string[]): void {
+function cmdStats(args: string[], paths: RouterPaths): CommandResult {
   const asJson = args.includes('--json');
   const stats = readLifetimeStats(paths.historyFile);
 
-  if (asJson) {
-    console.log(JSON.stringify(stats, null, 2));
-    return;
-  }
+  if (asJson) return ok([out(JSON.stringify(stats, null, 2))]);
 
   if (stats.requests === 0 && stats.errors === 0) {
-    console.log(term.dim('No routing history yet — savings are recorded once requests flow through the proxy.'));
-    return;
+    return ok([out(term.dim('No routing history yet — savings are recorded once requests flow through the proxy.'))]);
   }
 
-  const tierLine = ['haiku', 'sonnet', 'opus', 'passthrough']
+  // DISPLAY_TIERS, not a hand-written list — the copy here had gone stale and
+  // omitted `fable`, so a fable route counted toward the totals and appeared
+  // under no tier at all.
+  const tierLine = DISPLAY_TIERS
     .filter((t) => stats.tiers[t])
     .map((t) => `${term.tier(t)} ${stats.tiers[t]}`)
     .join(term.dim('  ·  '));
@@ -363,30 +410,34 @@ function cmdStats(args: string[]): void {
     rows.push(['Unpriced', term.yellow(`${calls} call${calls === 1 ? '' : 's'} — ${unpriced.map(([m]) => m).join(', ')}`)]);
   }
 
-  console.log('\n' + term.box('claude-router — lifetime savings', rows));
+  const lines = [out('\n' + term.box('claude-router — lifetime savings', rows))];
 
   if (unpriced.length > 0) {
-    console.log(
-      term.dim('\nUnpriced models are excluded from the cost and savings figures above.\n') +
-      term.dim('Add a "pricing" entry for each in ') + paths.configFile,
+    lines.push(
+      out(
+        term.dim('\nUnpriced models are excluded from the cost and savings figures above.\n') +
+          term.dim('Add a "pricing" entry for each in ') + paths.configFile,
+      ),
     );
   }
 
   const days = Object.keys(stats.byDay).sort().slice(-7);
   if (days.length > 0) {
-    console.log('\n' + term.bold('Last 7 days'));
+    lines.push(out('\n' + term.bold('Last 7 days')));
     for (const day of days) {
       const d = stats.byDay[day]!;
       const saved = formatSavedCents(d.savedCents, true);
-      console.log(`  ${day}  ${String(d.requests).padStart(5)} req   ${saved}`);
+      lines.push(out(`  ${day}  ${String(d.requests).padStart(5)} req   ${saved}`));
     }
   }
-  console.log(term.dim(`\nHistory: ${paths.historyFile}`));
+  lines.push(out(term.dim(`\nHistory: ${paths.historyFile}`)));
+  return ok(lines);
 }
 
 // ── logs ───────────────────────────────────────────────────────────────────
 
-function cmdLogs(args: string[]): void {
+/** Parse `logs`' own flags. Separate from the serve options — `logs` shares none. */
+export function parseLogsArgs(args: string[]): { lines: number; follow: boolean } {
   let lines = 50;
   let follow = false;
   for (let i = 0; i < args.length; i++) {
@@ -395,29 +446,37 @@ function cmdLogs(args: string[]): void {
     else if ((arg === '-n' || arg === '--lines') && args[i + 1]) {
       lines = parseInt(args[++i]!, 10) || 50;
     } else {
-      term.errorLine(`Unknown option '${arg}' for logs.`);
-      process.exit(1);
+      throw new CliUsageError(`Unknown option '${arg}' for logs.`);
     }
   }
+  return { lines, follow };
+}
+
+function cmdLogs(args: string[], paths: RouterPaths): CommandResult {
+  const { lines, follow } = parseLogsArgs(args);
 
   if (!fs.existsSync(paths.logFile)) {
-    console.log(term.dim(`No log file yet (${paths.logFile}). Start the daemon: claude-router start -d`));
-    return;
+    return ok([out(term.dim(`No log file yet (${paths.logFile}). Start the daemon: claude-router start -d`))]);
   }
 
   const initial = readLogTail(paths.logFile, null);
   const tail = initial.text.split('\n').slice(-lines - 1).join('\n');
-  if (tail) process.stdout.write(tail.endsWith('\n') ? tail : tail + '\n');
+  const result: OutputLine[] = [];
+  if (tail) result.push(raw(tail.endsWith('\n') ? tail : tail + '\n'));
 
   let size = initial.size;
   if (follow) {
-    console.log(term.dim('— following (ctrl+c to exit) —'));
+    result.push(out(term.dim('— following (ctrl+c to exit) —')));
+    // The follow loop is a stream, not a report — it writes as bytes arrive and
+    // keeps the process alive, which is why it is the one place outside
+    // `renderResult` that touches stdout.
     fs.watchFile(paths.logFile, { interval: 500 }, () => {
       const next = readLogTail(paths.logFile, size);
       if (next.text) process.stdout.write(next.text);
       size = next.size;
     });
   }
+  return ok(result);
 }
 
 /**
@@ -454,12 +513,15 @@ export function readLogTail(
 
 // ── install / uninstall ────────────────────────────────────────────────────
 
-async function cmdInstall(args: string[]): Promise<void> {
+async function cmdInstall(args: string[], paths: RouterPaths): Promise<CommandResult> {
   const { rest, found } = extractFlags(args, ['--no-autostart', '--no-env', '--no-statusline']);
-  const options = resolveOptions(rest);
+  const { options, warnings } = resolveOptions(rest, paths);
   const serveArgs = serveArgsFrom(options);
 
-  console.log(`\nInstalling claude-router ${term.dim(`(${platformName()})`)}\n`);
+  const lines: OutputLine[] = [
+    ...warnings,
+    out(`\nInstalling claude-router ${term.dim(`(${platformName()})`)}\n`),
+  ];
   let failures = 0;
 
   // 1. Autostart on login. On macOS/Linux the supervisor (launchd RunAtLoad /
@@ -468,7 +530,7 @@ async function cmdInstall(args: string[]): Promise<void> {
   //    supervisor's instance loops forever on EADDRINUSE.
   if (!found.has('--no-autostart')) {
     const result = installAutostart(serveArgs, paths);
-    printStep(result);
+    lines.push(stepLine(result));
     if (!result.ok && !result.skipped) failures++;
   }
 
@@ -494,68 +556,70 @@ async function cmdInstall(args: string[]): Promise<void> {
         paths,
       );
     }
-    printStep({
+    lines.push(stepLine({
       ok: true,
       detail: pid
         ? `Proxy running on port ${options.port} (pid ${pid}, autostart-supervised)`
         : `Proxy already running on port ${options.port}`,
-    });
+    }));
   } else {
     const start = await startDaemon(serveArgs, options.port, paths);
-    printStep({ ok: start.ok, detail: start.detail });
+    lines.push(stepLine({ ok: start.ok, detail: start.detail }));
     if (!start.ok) failures++;
   }
 
   // 3. Environment variable
   if (!found.has('--no-env')) {
     const result = setEnvVar(options.port, paths);
-    printStep(result);
+    lines.push(stepLine(result));
     if (!result.ok && !result.skipped) failures++;
   }
 
   // 4. Claude Code statusline
   if (!found.has('--no-statusline')) {
     const result = addStatusline(options.port, paths);
-    printStep(result);
+    lines.push(stepLine(result));
     if (!result.ok && !result.skipped) failures++;
   }
 
   if (failures > 0) {
-    console.log(`\n${term.fail()} Install finished with ${failures} failed step(s) — see above.`);
-    process.exit(1);
+    lines.push(out(`\n${term.fail()} Install finished with ${failures} failed step(s) — see above.`));
+    return failed(lines);
   }
 
   const envNote = platformName() === 'windows'
     ? 'Open a new terminal (setx applies to new sessions only)'
     : 'Restart your terminal (or: source your shell rc file)';
-  console.log(`
+  lines.push(out(`
 ${term.ok()} Done. Requests to ${term.accent(`http://localhost:${options.port}`)} are auto-routed.
 
   ${term.dim('→')} ${envNote}
   ${term.dim('→')} Use ${term.accent('claude')} normally — calls route through the proxy
   ${term.dim('→')} Check anytime: ${term.accent('claude-router status')} · ${term.accent('claude-router doctor')}
-`);
+`));
+  return ok(lines);
 }
 
-async function cmdUninstall(): Promise<void> {
-  console.log(`\nUninstalling claude-router ${term.dim(`(${platformName()})`)}\n`);
+async function cmdUninstall(_args: string[], paths: RouterPaths): Promise<CommandResult> {
+  const lines: OutputLine[] = [
+    out(`\nUninstalling claude-router ${term.dim(`(${platformName()})`)}\n`),
+  ];
 
   const stop = await stopDaemon(paths);
-  printStep({ ok: stop.ok, detail: stop.detail, skipped: !stop.ok });
-  printStep(uninstallAutostart(paths));
-  printStep(unsetEnvVar(paths));
-  printStep(removeStatusline(paths));
-
-  console.log(`\n${term.ok()} claude-router uninstalled.\n`);
+  lines.push(stepLine({ ok: stop.ok, detail: stop.detail, skipped: !stop.ok }));
+  lines.push(stepLine(uninstallAutostart(paths)));
+  lines.push(stepLine(unsetEnvVar(paths)));
+  lines.push(stepLine(removeStatusline(paths)));
+  lines.push(out(`\n${term.ok()} claude-router uninstalled.\n`));
+  return ok(lines);
 }
 
 // ── init ───────────────────────────────────────────────────────────────────
 
-function cmdInit(args: string[]): void {
+function cmdInit(args: string[], paths: RouterPaths): CommandResult {
   const { rest, found } = extractFlags(args, ['--force']);
   if (fs.existsSync(paths.configFile) && !found.has('--force')) {
-    term.errorLine(`${paths.configFile} already exists. Use --force to overwrite.`);
-    process.exit(1);
+    return failed([failLine(`${paths.configFile} already exists. Use --force to overwrite.`)]);
   }
 
   const options = parseServeArgs(rest, {});
@@ -563,86 +627,55 @@ function cmdInit(args: string[]): void {
 
   fs.mkdirSync(paths.configDir, { recursive: true });
   fs.writeFileSync(paths.configFile, JSON.stringify(config, null, 2) + '\n', 'utf8');
-  console.log(`${term.ok()} Wrote ${paths.configFile}`);
-  console.log(term.dim('  Edit it to add per-tier model overrides ("tiers") or pricing ("pricing").'));
+  return ok([
+    out(`${term.ok()} Wrote ${paths.configFile}`),
+    out(term.dim('  Edit it to add per-tier model overrides ("tiers") or pricing ("pricing").')),
+  ]);
 }
 
 // ── doctor ─────────────────────────────────────────────────────────────────
 
-async function cmdDoctor(args: string[]): Promise<void> {
-  const options = resolveOptions(args);
-  console.log(`\n${term.bold('claude-router doctor')} ${term.dim(`(${platformName()})`)}\n`);
-  let failures = 0;
-  const check = (ok: boolean, label: string, hint?: string, warnOnly = false) => {
-    const glyph = ok ? term.ok() : warnOnly ? term.warn() : term.fail();
-    console.log(`  ${glyph} ${label}`);
-    if (!ok && hint) console.log(term.dim(`      ${hint}`));
-    if (!ok && !warnOnly) failures++;
+/** The live probes — the production adapter for {@link DoctorProbes}. */
+function liveProbes(paths: RouterPaths): DoctorProbes {
+  return {
+    nodeVersion: process.versions.node,
+    platform: platformName(),
+    loadConfig: () => loadFileConfig(paths.configFile),
+    checkHealth: (port) => checkHealth(port),
+    isEnvVarSet: (port) => isEnvVarSet(port),
+    apiKeySet: () => Boolean(process.env['ANTHROPIC_API_KEY']),
+    daemonState: () => readDaemonState(paths),
+    isProcessAlive: (pid) => isProcessAlive(pid),
+    isAutostartRegistered: () => isAutostartRegistered(paths),
+    isStatuslineConfigured: () => isStatuslineConfigured(paths),
   };
+}
 
-  const [major] = process.versions.node.split('.').map(Number);
-  check(major! >= 18, `Node ${process.versions.node} (need ≥ 18)`);
-
-  const { loaded, error } = loadFileConfig(paths.configFile);
-  if (error) check(false, `Config file invalid: ${error}`, `Fix or regenerate: claude-router init --force`);
-  else check(true, loaded ? `Config file loaded (${paths.configFile})` : 'No config file (defaults in use)');
-
-  const health = await checkHealth(options.port);
-  check(
-    health !== null,
-    health ? `Proxy healthy on port ${options.port}` : `No proxy responding on port ${options.port}`,
-    'Start it: claude-router start -d',
+async function cmdDoctor(args: string[], paths: RouterPaths): Promise<CommandResult> {
+  const { options, warnings } = resolveOptions(args, paths);
+  const diagnostics = await runDiagnostics(
+    { port: options.port, provider: options.provider, configFile: paths.configFile },
+    liveProbes(paths),
   );
 
-  const envOk = isEnvVarSet(options.port);
-  check(
-    envOk,
-    envOk
-      ? `ANTHROPIC_BASE_URL points at the proxy`
-      : `ANTHROPIC_BASE_URL is not set to http://localhost:${options.port}`,
-    platformName() === 'windows'
-      ? `Set it: setx ANTHROPIC_BASE_URL http://localhost:${options.port} (then open a new terminal)`
-      : `Add to your shell rc: export ANTHROPIC_BASE_URL=http://localhost:${options.port}`,
-  );
-
-  check(
-    Boolean(process.env['ANTHROPIC_API_KEY']) || options.provider !== 'anthropic',
-    process.env['ANTHROPIC_API_KEY']
-      ? 'ANTHROPIC_API_KEY is set'
-      : 'ANTHROPIC_API_KEY not set (fine if Claude Code sends its own auth)',
-    undefined,
-    true,
-  );
-
-  const state = readDaemonState(paths);
-  if (state) {
-    check(
-      isProcessAlive(state.pid),
-      isProcessAlive(state.pid)
-        ? `Daemon state matches a live process (pid ${state.pid})`
-        : `Stale daemon state (pid ${state.pid} is gone)`,
-      'Clear it by restarting: claude-router restart',
-      true,
-    );
-  }
-
-  check(isAutostartRegistered(paths), isAutostartRegistered(paths) ? 'Autostart registered' : 'Autostart not registered', 'Register it: claude-router install', true);
-  check(isStatuslineConfigured(paths), isStatuslineConfigured(paths) ? 'Claude Code statusline configured' : 'Statusline not configured', 'Add it: claude-router install', true);
-
-  console.log(
-    failures === 0
-      ? `\n${term.ok()} Everything looks good.\n`
-      : `\n${term.fail()} ${failures} problem(s) found.\n`,
-  );
-  process.exit(failures);
+  return {
+    lines: [
+      ...warnings,
+      out(`\n${term.bold('claude-router doctor')} ${term.dim(`(${platformName()})`)}\n`),
+      ...formatDiagnostics(diagnostics),
+    ],
+    // The exit code IS doctor's contract for CI users: the number of hard
+    // failures. Derived from the diagnostics rather than counted while printing.
+    exitCode: failureCount(diagnostics),
+  };
 }
 
 // ── help ───────────────────────────────────────────────────────────────────
 
-function printHelp(): void {
+function helpResult(): CommandResult {
   const a = (s: string) => term.accent(s);
   const d = (s: string) => term.dim(s);
-  console.log(`
+  return ok([out(`
 ${term.bold('claude-router')} ${d('v' + getVersion())} — auto-route Claude API calls by prompt complexity
 
 ${term.bold('Usage')}
@@ -680,70 +713,85 @@ ${term.bold('Config file')} ${d('(~/.claude-router/config.json — flags always 
 ${term.bold('Quick start')}
   ${a('claude-router install --force-route')}
   ${d('# open a new terminal, then use `claude` normally')}
-`);
+`)]);
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const [subcommand, ...rest] = process.argv.slice(2);
+/**
+ * Dispatch one invocation and report what should be shown and exited with.
+ *
+ * Takes argv and paths rather than reading `process.argv` and `os.homedir()`:
+ * `paths` used to be resolved once at module scope, which pinned every command
+ * to the operator's real `~/.claude-router` — the leaf modules all accepted an
+ * injectable `RouterPaths` already, so the seam existed everywhere except at the
+ * root that used it.
+ */
+export async function main(
+  argv: string[],
+  paths: RouterPaths = routerPaths(),
+): Promise<CommandResult> {
+  const [subcommand, ...rest] = argv;
 
   if (!subcommand || subcommand === '--help' || subcommand === '-h' || subcommand === 'help') {
-    printHelp();
-    return;
+    return helpResult();
   }
 
   if (subcommand === '--version' || subcommand === '-V') {
-    console.log(getVersion());
-    return;
+    return ok([out(getVersion())]);
   }
 
-  // Legacy invocation: bare flags with no subcommand used to mean `start`
-  if (subcommand.startsWith('-')) {
-    console.error(term.warn() + ' Deprecated: bare flags now require the `start` subcommand — running `start` for you.');
-    await cmdStart(process.argv.slice(2));
-    return;
-  }
+  // Lines emitted before the command runs, so they survive a usage error the
+  // same way they did when they were printed on the way in.
+  const prefix: OutputLine[] = [];
 
-  if (rest.includes('--help') || rest.includes('-h')) {
-    printHelp();
-    return;
-  }
-
-  switch (subcommand) {
-    case 'start': return cmdStart(rest);
-    case 'stop': return cmdStop();
-    case 'restart': return cmdRestart(rest);
-    case 'status': return cmdStatus(rest);
-    case 'stats': return cmdStats(rest);
-    case 'logs': return cmdLogs(rest);
-    case 'install': return cmdInstall(rest);
-    case 'uninstall': return cmdUninstall();
-    case 'init': return cmdInit(rest);
-    case 'doctor': return cmdDoctor(rest);
-    default: {
-      const suggestion = suggestCommand(subcommand, COMMANDS);
-      term.errorLine(
-        `Unknown command '${subcommand}'.` + (suggestion ? ` Did you mean '${suggestion}'?` : ''),
+  try {
+    // Legacy invocation: bare flags with no subcommand used to mean `start`
+    if (subcommand.startsWith('-')) {
+      prefix.push(
+        warnLine('Deprecated: bare flags now require the `start` subcommand — running `start` for you.'),
       );
-      console.error(term.dim(`Run 'claude-router help' for usage.`));
-      process.exit(1);
+      const result = await cmdStart(argv, paths);
+      return { ...result, lines: [...prefix, ...result.lines] };
     }
+
+    if (rest.includes('--help') || rest.includes('-h')) return helpResult();
+
+    switch (subcommand) {
+      case 'start': return await cmdStart(rest, paths);
+      case 'stop': return await cmdStop(rest, paths);
+      case 'restart': return await cmdRestart(rest, paths);
+      case 'status': return await cmdStatus(rest, paths);
+      case 'stats': return cmdStats(rest, paths);
+      case 'logs': return cmdLogs(rest, paths);
+      case 'install': return await cmdInstall(rest, paths);
+      case 'uninstall': return await cmdUninstall(rest, paths);
+      case 'init': return cmdInit(rest, paths);
+      case 'doctor': return await cmdDoctor(rest, paths);
+      default: {
+        const suggestion = suggestCommand(subcommand, COMMANDS);
+        return failed([
+          failLine(`Unknown command '${subcommand}'.` + (suggestion ? ` Did you mean '${suggestion}'?` : '')),
+          err(term.dim(`Run 'claude-router help' for usage.`)),
+        ]);
+      }
+    }
+  } catch (e) {
+    if (e instanceof CliUsageError) return failed([...prefix, failLine(e.message)]);
+    throw e;
   }
 }
 
 // Only dispatch when executed as the entry script (`claude-router …` /
-// `node dist/proxy/cli.js`). Importing this module (tests need startServer)
+// `node dist/proxy/cli.js`). Importing this module (tests need main/startServer)
 // must not run the CLI — before this guard, a bare import executed main()
 // against the importer's argv and exited the process. (CJS output, so the
 // require.main idiom is the entry check.)
 if (require.main === module) {
-  main().catch((err) => {
-    if (err instanceof CliUsageError) {
-      term.errorLine(err.message);
-    } else {
-      term.errorLine(String(err));
-    }
-    process.exit(1);
-  });
+  main(process.argv.slice(2))
+    .then(renderResult)
+    .catch((e) => {
+      term.errorLine(String(e));
+      process.exit(1);
+    });
 }
